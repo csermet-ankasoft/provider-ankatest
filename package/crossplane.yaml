@@ -8,3 +8,7 @@ metadata:
     meta.crossplane.io/license: Apache-2.0
     meta.crossplane.io/description: |
       A ankatest that can be used to create Crossplane providers.
+spec:
+  controller:
+    image: ankasoftware/provider-vra-controller:v0.0.1
+    # image: DOCKER_REGISTRY/provider-vra-controller:VERSION

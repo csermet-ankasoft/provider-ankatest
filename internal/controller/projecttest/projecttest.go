@@ -20,18 +20,25 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/vmware/vra-sdk-go/pkg/client/project"
+
+	"github.com/crossplane/provider-ankatest/internal/clients"
 	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
+	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 
 	apisv1alpha1 "github.com/crossplane/provider-ankatest/apis/v1alpha1"
+	p "github.com/crossplane/provider-ankatest/internal/clients/project"
+
 	"github.com/crossplane/provider-ankatest/apis/vratest/v1alpha1"
 	"github.com/crossplane/provider-ankatest/internal/features"
 )
@@ -41,6 +48,11 @@ const (
 	errTrackPCUsage   = "cannot track ProviderConfig usage"
 	errGetPC          = "cannot get ProviderConfig"
 	errGetCreds       = "cannot get credentials"
+
+	errCreateFailed = "cannot create project with vRA API"
+	// errGetFailed    = "cannot get project from vRA API"
+	errDeleteFailed = "cannot delete project from vRA API"
+	errUpdateFailed = "cannot update project from vRA API"
 
 	errNewClient = "cannot create new Service"
 )
@@ -54,22 +66,30 @@ var (
 
 // Setup adds a controller that reconciles ProjectTest managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
-	print("woooo1")
 	name := managed.ControllerName(v1alpha1.ProjectTestGroupKind)
-	print("woooo2")
+
 	cps := []managed.ConnectionPublisher{managed.NewAPISecretPublisher(mgr.GetClient(), mgr.GetScheme())}
 	if o.Features.Enabled(features.EnableAlphaExternalSecretStores) {
 		cps = append(cps, connection.NewDetailsManager(mgr.GetClient(), apisv1alpha1.StoreConfigGroupVersionKind))
 	}
-	print("woooo3")
 
-	print("woooo4")
+	r := managed.NewReconciler(mgr,
+		resource.ManagedKind(v1alpha1.ProjectTestGroupVersionKind),
+		managed.WithExternalConnecter(&connector{
+			kube:         mgr.GetClient(),
+			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
+			newServiceFn: p.NewProjectClient}),
+		managed.WithLogger(o.Logger.WithValues("controller", name)),
+		managed.WithPollInterval(o.PollInterval),
+		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+		managed.WithConnectionPublishers(cps...))
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithOptions(o.ForControllerRuntime()).
 		WithEventFilter(resource.DesiredStateChanged()).
 		For(&v1alpha1.ProjectTest{}).
-		Complete(ratelimiter.NewReconciler(name, nil, o.GlobalRateLimiter))
+		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
 // A connector is expected to produce an ExternalClient when its Connect method
@@ -77,7 +97,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 type connector struct {
 	kube         client.Client
 	usage        resource.Tracker
-	newServiceFn func(creds []byte) (interface{}, error)
+	newServiceFn func(cfg clients.Config) project.ClientService
 }
 
 // Connect typically produces an ExternalClient by:
@@ -95,31 +115,20 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errTrackPCUsage)
 	}
 
-	pc := &apisv1alpha1.ProviderConfig{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: cr.GetProviderConfigReference().Name}, pc); err != nil {
-		return nil, errors.Wrap(err, errGetPC)
-	}
-
-	cd := pc.Spec.Credentials
-	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+	cfg, err := clients.GetConfig(ctx, c.kube, cr)
 	if err != nil {
-		return nil, errors.Wrap(err, errGetCreds)
+		return nil, err
 	}
-
-	svc, err := c.newServiceFn(data)
-	if err != nil {
-		return nil, errors.Wrap(err, errNewClient)
-	}
-
-	return &external{service: svc}, nil
+	return &external{kube: c.kube, service: c.newServiceFn(*cfg)}, nil
 }
 
 // An ExternalClient observes, then either creates, updates, or deletes an
 // external resource to ensure it reflects the managed resource's desired state.
 type external struct {
+	kube client.Client
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
-	service interface{}
+	service project.ClientService
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
@@ -131,6 +140,31 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	// These fmt statements should be removed in the real implementation.
 	fmt.Printf("Observing: %+v", cr)
 
+	externalName := meta.GetExternalName(cr)
+	if externalName == "" {
+		return managed.ExternalObservation{ResourceExists: false}, nil
+	}
+
+	projectID := externalName
+
+	params := p.GenerateGetProjectOptions(projectID)
+
+	// current value of the resource.
+	proj, _ := c.service.GetProject(params)
+
+	// desired value of the resource. (it reads the current yaml to determine desired state)
+	desired := cr.Spec.ForProvider.DeepCopy()
+
+	if proj == nil {
+		return managed.ExternalObservation{ResourceExists: false}, nil
+	}
+
+	resourceUpToDate := p.IsResourceUpToDate(desired, proj.Payload)
+
+	// TODO: Check the deployment process here...
+	cr.Status.AtProvider = p.GenerateProjectTestObservation(proj)
+	cr.Status.SetConditions(xpv1.Available())
+	// dep.Status
 	return managed.ExternalObservation{
 		// Return false when the external resource does not exist. This lets
 		// the managed resource reconciler know that it needs to call Create to
@@ -140,7 +174,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		// Return false when the external resource exists, but it not up to date
 		// with the desired managed resource state. This lets the managed
 		// resource reconciler know that it needs to call Update.
-		ResourceUpToDate: true,
+		ResourceUpToDate: resourceUpToDate,
 
 		// Return any details that may be required to connect to the external
 		// resource. These will be stored as the connection secret.
@@ -155,6 +189,20 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	}
 
 	fmt.Printf("Creating: %+v", cr)
+
+	cr.Status.SetConditions(xpv1.Creating())
+
+	projectParams := p.GenerateCreateProjectOptions(&cr.Spec.ForProvider)
+
+	response, err := c.service.CreateProject(projectParams)
+	if err != nil {
+		return managed.ExternalCreation{}, errors.Wrap(err, errCreateFailed)
+	}
+
+	fmt.Println("Project Id: " + *response.Payload.ID)
+	meta.SetExternalName(cr, fmt.Sprint(*response.Payload.ID))
+
+	cr.Status.SetConditions(xpv1.Available())
 
 	return managed.ExternalCreation{
 		// Optionally return any details that may be required to connect to the
@@ -171,6 +219,16 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 
 	fmt.Printf("Updating: %+v", cr)
 
+	cr.Status.SetConditions(xpv1.Creating())
+
+	externalName := meta.GetExternalName(cr)
+	params := p.GenerateUpdateProjectOptions(externalName, &cr.Spec.ForProvider)
+
+	if _, err := c.service.UpdateProject(params); err != nil {
+		return managed.ExternalUpdate{}, errors.Wrap(err, errUpdateFailed)
+	}
+	cr.Status.SetConditions(xpv1.Available())
+
 	return managed.ExternalUpdate{
 		// Optionally return any details that may be required to connect to the
 		// external resource. These will be stored as the connection secret.
@@ -185,6 +243,16 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	}
 
 	fmt.Printf("Deleting: %+v", cr)
+
+	externalName := meta.GetExternalName(cr)
+
+	params := p.GenerateDeleteProjectOptions(externalName)
+	if _, err := c.service.DeleteProject(params); err != nil {
+		return errors.Wrap(err, errDeleteFailed)
+	}
+	// todo: check the decommissioning process here...
+
+	cr.Status.SetConditions(xpv1.Deleting())
 
 	return nil
 }
